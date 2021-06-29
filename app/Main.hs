@@ -21,6 +21,7 @@ import Formatting
 import Formatting.Clock
 import System.Clock
 import System.IO.Unsafe
+import System.Environment (getArgs)
 
 hello :: IO Int
 hello = do
@@ -33,9 +34,6 @@ yb = "postgresql://yugabyte:yugabyte@localhost:5433/db"
 
 pg :: ByteString
 pg = "postgresql://postgres:password@localhost:8000/postgres"
-
-connString :: ByteString
-connString = yb
 
 -- | 2 KB of garbage
 stuff :: ByteString
@@ -59,7 +57,7 @@ grabEvent conn = do
   query_ conn q >>= \case
     [Only eventId] -> pure eventId
     x -> do
-      print x
+      putStrLn "failed to grab event"
       pure Nothing
 
 markEventCompleted :: Connection -> UUID -> IO ()
@@ -79,7 +77,7 @@ eventsConsumedPerSecond :: Int
 eventsConsumedPerSecond = 5
 
 eventsProducedPerSecond :: Int
-eventsProducedPerSecond = 200
+eventsProducedPerSecond = 5000
 
 consumerSpawnDelay :: Int
 consumerSpawnDelay = micro `div` eventsConsumedPerSecond
@@ -87,9 +85,9 @@ consumerSpawnDelay = micro `div` eventsConsumedPerSecond
 produceDelay :: Int
 produceDelay = micro `div` eventsProducedPerSecond
 
-numProducers = 5
+numProducers = 1
 
-numConsumers = 20
+numConsumers = 10
 
 processEvents :: Connection -> TVar Int -> IO ()
 processEvents conn v = go
@@ -106,8 +104,9 @@ processEvents conn v = go
 -- threadDelay processingDelay
 -- putStrLn $ "done event id " <> show e
 
-client :: IO ()
-client = do
+client :: ByteString -> IO ()
+client connString = do
+  print connString
   conn <- connectPostgreSQL connString
   -- putStrLn "initialising db"
   initDb conn
@@ -120,7 +119,10 @@ client = do
         threadDelay produceDelay
     pure handle
 
-  threadDelay (2 * micro)
+  threadDelay (10 * micro)
+
+  -- we could add all events _before_ consuming
+  -- traverse_ cancel producers
 
   counter <- newTVarIO 0
 
@@ -149,5 +151,8 @@ client = do
 
 main :: IO ()
 main = do
-  print connString
-  client
+  args <- getArgs
+  case args of
+    ["pg"] -> client pg
+    ["yb"] -> client yb
+    _ -> putStrLn "error: expecting either 'pg' or 'yb' as a command-line argument"

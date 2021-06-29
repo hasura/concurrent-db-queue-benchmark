@@ -5,7 +5,7 @@ WHERE id = (
   FROM queue
   WHERE status = 'created'
   ORDER BY id
-  /* FOR UPDATE SKIP LOCKED */
+  FOR UPDATE SKIP LOCKED
   LIMIT 1
 )
 RETURNING id;
