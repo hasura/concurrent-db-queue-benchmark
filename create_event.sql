@@ -1,2 +1,2 @@
-INSERT INTO queue(id, status)
-VALUES (?, 'created');
+INSERT INTO queue(status, stuff)
+VALUES ('created', ?);

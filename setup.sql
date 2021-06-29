@@ -1,9 +1,8 @@
 DROP TABLE IF EXISTS queue;
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
 CREATE TABLE queue(
-  id INTEGER PRIMARY KEY,
+  id uuid NOT NULL DEFAULT gen_random_uuid(),
   status TEXT NOT NULL DEFAULT 'created',
+  stuff TEXT NOT NULL,
   CHECK (status IN ('created', 'processing', 'completed', 'error'))
 );
-
-INSERT INTO queue(id, status)
-SELECT x, 'created' FROM generate_series(1,10) x;

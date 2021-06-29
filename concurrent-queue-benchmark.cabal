@@ -7,6 +7,8 @@ extra-source-files: CHANGELOG.md
 
 executable concurrent-queue-benchmark
     main-is:          Main.hs
-    build-depends:    base ^>=4.14.1.0, timers, async, stm, postgresql-simple, text, bytestring
+    build-depends:    
+      base ^>=4.14.1.0, timers, async, stm, postgresql-simple, text, bytestring, 
+      relude, uuid, clock, formatting
     hs-source-dirs:   app
     default-language: Haskell2010
