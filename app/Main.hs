@@ -20,14 +20,8 @@ import Database.PostgreSQL.Simple
 import Formatting
 import Formatting.Clock
 import System.Clock
-import System.IO.Unsafe
 import System.Environment (getArgs)
-
-hello :: IO Int
-hello = do
-  conn <- connectPostgreSQL pg
-  [Only i] <- query_ conn "select 2 + 2"
-  return i
+import System.IO.Unsafe
 
 yb :: ByteString
 yb = "postgresql://yugabyte:yugabyte@localhost:5433/db"
@@ -39,115 +33,67 @@ pg = "postgresql://postgres:password@localhost:8000/postgres"
 stuff :: ByteString
 stuff = fromString $ replicate 2048 'a'
 
-initDb :: Connection -> IO ()
-initDb conn = do
-  q <- fromString <$> readFile "setup.sql"
+runSql f conn = void do
+  q <- fromString <$> readFile f
   execute_ conn q
-  pure ()
 
-createEvent :: Connection -> IO ()
-createEvent conn = do
-  q <- fromString <$> readFile "create_event.sql"
-  execute conn q (Only stuff)
-  pure ()
+fetch1 :: Connection -> IO ()
+fetch1 = runSql "fetch1.sql"
 
-grabEvent :: Connection -> IO (Maybe UUID)
-grabEvent conn = do
-  q <- fromString <$> readFile "grab_event.sql"
-  query_ conn q >>= \case
-    [Only eventId] -> pure eventId
-    x -> do
-      putStrLn "failed to grab event"
-      pure Nothing
-
-markEventCompleted :: Connection -> UUID -> IO ()
-markEventCompleted conn id = do
-  q <- fromString <$> readFile "complete_event.sql"
-  execute conn q (Only id)
-  -- putStrLn $ "marked complete " <> show id
-  pure ()
+fetch2 :: Connection -> IO ()
+fetch2 = runSql "fetch2.sql"
 
 micro :: Int
 micro = 1000000
 
-processingDelay :: Int
-processingDelay = 2 * micro
-
-eventsConsumedPerSecond :: Int
-eventsConsumedPerSecond = 5
-
-eventsProducedPerSecond :: Int
-eventsProducedPerSecond = 5000
-
-consumerSpawnDelay :: Int
-consumerSpawnDelay = micro `div` eventsConsumedPerSecond
-
-produceDelay :: Int
-produceDelay = micro `div` eventsProducedPerSecond
-
-numProducers = 1
-
-numConsumers = 10
-
-processEvents :: Connection -> TVar Int -> IO ()
-processEvents conn v = go
+processEvents :: Connection -> TVar Int -> String -> IO ()
+processEvents conn v q = go
   where
-    go = do
-      eventId <- grabEvent conn
-      for eventId \e -> do
-        markEventCompleted conn e
-        atomically (modifyTVar' v (+ 1))
-        go
-      pure ()
+    go = forever do
+      -- fetch conn >>= print
+      runSql q conn
+      atomically (modifyTVar' v (+ 1))
 
 -- putStrLn $ "grab event id " <> show e
 -- threadDelay processingDelay
 -- putStrLn $ "done event id " <> show e
 
 client :: ByteString -> IO ()
-client connString = do
+client connString = void do
   print connString
-  conn <- connectPostgreSQL connString
-  -- putStrLn "initialising db"
-  initDb conn
+  runTest True
+  runTest False
+  where
+    runTest x = do
+      putStr "initialising db... "
+      conn1 <- connectPostgreSQL connString
+      conn2 <- connectPostgreSQL connString
+      initDb conn1
 
-  producers <- for [1 .. numProducers] \j -> do
-    -- putStrLn $ "producer " <> show j <> " spawn"
-    handle <- async do
-      forever do
-        createEvent conn
-        threadDelay produceDelay
-    pure handle
+      putStrLn "done."
 
-  threadDelay (10 * micro)
-
-  -- we could add all events _before_ consuming
-  -- traverse_ cancel producers
-
-  counter <- newTVarIO 0
-
-  consumers <- for [1 .. numConsumers] \j -> do
-    -- putStrLn $ "consumer " <> show j <> " spawn"
-    async do processEvents conn counter
-
-  start <- getTime Monotonic
-
-  threadDelay (10 * micro)
-  -- putStrLn $ "killing consumers"
-  traverse_ cancel consumers
-
-  end <- getTime Monotonic
-  -- fprint (timeSpecs % "\n") start end
-  n <- readTVarIO counter
-  putStrLn $
-    "processed " <> show n <> " events in "
-      <> show (toNanoSecs (diffTimeSpec end start) `div` 1_000_000)
-      <> " ms with " <> show numConsumers <> " consumers"
-
-  -- putStrLn $ "killing producers"
-  traverse_ cancel producers
-
-  pure ()
+      counter1 <- newTVarIO 0
+      counter2 <- newTVarIO 0
+      handle1 <- async do processEvents conn1 counter1 "fetch1.sql"
+      handle2 <- async do processEvents conn2 counter2 (if x then "fetch1.sql" else "fetch2.sql")
+      start <- getTime Monotonic
+      threadDelay (120 * micro)
+      cancel handle1
+      cancel handle2
+      end <- getTime Monotonic
+      n1 <- readTVarIO counter1
+      n2 <- readTVarIO counter2
+      putStrLn $
+        (if x then "same" else "different") <> " project ids: "
+          <> "processed "
+          <> show n1
+          <> " + "
+          <> show n2
+          <> " = "
+          <> show (n1 + n2)
+          <> " fetches in "
+          <> show (toNanoSecs (diffTimeSpec end start) `div` 1_000_000)
+          <> " ms"
 
 main :: IO ()
 main = do
@@ -156,3 +102,9 @@ main = do
     ["pg"] -> client pg
     ["yb"] -> client yb
     _ -> putStrLn "error: expecting either 'pg' or 'yb' as a command-line argument"
+
+initDb :: Connection -> IO ()
+initDb conn = do
+  q <- fromString <$> readFile "project_id_setup.sql"
+  execute_ conn q
+  pure ()
