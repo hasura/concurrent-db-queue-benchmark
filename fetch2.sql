@@ -1,4 +1,4 @@
-UPDATE hdb_cron_events
+WITH rows as (UPDATE hdb_cron_events
             SET status = 'locked'
             WHERE id IN ( SELECT t.id
                           FROM hdb_cron_events t
@@ -10,4 +10,5 @@ UPDATE hdb_cron_events
                                   AND project_id = 'project2'
                                 )
                           FOR UPDATE SKIP LOCKED LIMIT 100
-                          ) AND project_id = 'project2';
+                          ORDER BY t.scheduled_time
+                          ) AND project_id = 'project2' RETURNING *) SELECT count(*) FROM rows;
