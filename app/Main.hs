@@ -19,6 +19,7 @@ import Data.Coerce (coerce)
 import qualified Data.Fixed as Fixed
 import Data.Pool (Pool)
 import qualified Data.Pool as Pool
+import Data.String (String)
 import qualified Data.String
 import qualified Data.Text as T
 import Data.UUID (UUID)
@@ -108,7 +109,8 @@ data Stats a = Stats
     statsMean :: a,
     statsStdDev :: a,
     statsSkewness :: a
-  } deriving (Show)
+  }
+  deriving (Show)
 
 toElapsedTime :: Double -> ElapsedTime
 toElapsedTime = ElapsedTime . realToFrac
@@ -143,8 +145,8 @@ ppStats xs =
 
 timedReplicate :: MonadIO m => Int -> m a -> m (Vector ElapsedTime)
 timedReplicate n k =
-    Vector.forM (Vector.fromList [1 .. n]) \_i ->
-      elapsedTime k
+  Vector.forM (Vector.fromList [1 .. n]) \_i ->
+    elapsedTime k
 
 --------------------------------------------------------------------------------
 -- toplevel
@@ -153,27 +155,39 @@ main :: IO ()
 main = void do
   putText "starting benchmark"
   env <- BenchEnv <$> initPool connStrLocalPG
-  let numProjects = 10000
+  let numProjects = 1000
       numFetches = 10
+      numExtraFetches = numFetches
       numEventsPerFetch = 100
-      numEventsPerProject = numEventsPerFetch * numFetches
+      numEventsPerProject = numEventsPerFetch * (numFetches + numExtraFetches)
 
   projIds <- replicateM numProjects mkProjectId
 
   putText "setting up schema"
   runBenchM env do schemaSetup
 
-  putText "creating events"
-  forConcurrently_ projIds \projId -> do
-    runBenchM env $ do
-      elapsedTime do
-        createEventsFor projId numEventsPerProject
+  putStr @String "creating events"
+  createEventsTimes <-
+    Vector.fromList
+      <$> forConcurrently (zip [1 ..] projIds) \(i, projId) -> do
+        runBenchM env $ do
+          elapsedTime do
+            putStr @String ("\rcreating events: " <> show @Int i)
+            createEventsFor projId numEventsPerProject
+  putText ""
+  putText "event creation times:"
+  ppStats createEventsTimes
+  putText ""
 
   putText "fetching events"
-  batchFetchTimes <- Vector.concat <$> forConcurrently projIds \projId -> do
-    runBenchM env do
-      timedReplicate numFetches (projectWorker projId numEventsPerFetch)
+  batchFetchTimes <-
+    Vector.concat <$> forConcurrently projIds \projId -> do
+      runBenchM env do
+        timedReplicate numFetches (projectWorker projId numEventsPerFetch)
+
+  putText "batch fetch times: "
   ppStats batchFetchTimes
+  putText ""
 
 --------------------------------------------------------------------------------
 -- database operations
@@ -182,23 +196,25 @@ schemaSetup :: BenchM ()
 schemaSetup = withConn \conn -> void do
   setup <- readQuery "sql/setup.sql"
   liftIO (PG.execute_ conn setup)
-  -- putText ("created schema: " <> show r)
+
+-- putText ("created schema: " <> show r)
 
 createEventsFor :: ProjectId -> Int -> BenchM ()
 createEventsFor (ProjectId projectId) numEventsPerProject = withConn \conn -> void do
   q <- readQuery "sql/create_events.sql"
   liftIO (PG.execute conn q (projectId, numEventsPerProject))
-  -- putText ("created " <> show r <> " events")
+
+-- putText ("created " <> show r <> " events")
 
 fetchEventsFor :: ProjectId -> Int -> BenchM ()
 fetchEventsFor (ProjectId proj) numEventsPerFetch = withConn \conn -> void do
   -- putText ("fetching events for " <> show proj)
   q <- readQuery "sql/fetch.sql"
   liftIO (PG.execute conn q (proj, numEventsPerFetch, proj))
-  -- putText ("fetched " <> show r <> " events")
+
+-- putText ("fetched " <> show r <> " events")
 
 projectWorker :: ProjectId -> Int -> BenchM ()
 projectWorker projId numEventsPerFetch = do
   fetchEventsFor projId numEventsPerFetch
   liftIO (threadDelay (1 * 1_000_000))
-
