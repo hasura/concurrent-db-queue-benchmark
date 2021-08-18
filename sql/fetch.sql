@@ -10,5 +10,5 @@ WHERE
           OR ( t.next_retry_at is not NULL and t.next_retry_at <= now())
         ) AND project_id = ?
       ) FOR UPDATE SKIP LOCKED 
-    LIMIT 100
+    LIMIT ?
   ) AND project_id = ?;

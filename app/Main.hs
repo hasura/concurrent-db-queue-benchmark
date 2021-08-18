@@ -2,17 +2,20 @@
 {-# LANGUAGE DerivingStrategies #-}
 {-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE TypeApplications #-}
+{-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
-{-# LANGUAGE UndecidableInstances #-}
 
 module Main where
 
 import Control.Concurrent.Async (forConcurrently_)
-import Control.Monad.Trans.Control
 import Control.Monad.Base
+import Control.Monad.Trans.Control
 import Data.Coerce (coerce)
+import qualified Data.Fixed as Fixed
 import Data.Pool (Pool)
 import qualified Data.Pool as Pool
 import qualified Data.String
@@ -24,77 +27,122 @@ import qualified Data.Vector as V
 import qualified Database.PostgreSQL.Simple as PG
 import Protolude
 import Protolude.Conv
+import qualified System.Clock as Clock
 
 data Bench = BenchInsert | BenchFetch | BenchDelete
   deriving (Show)
 
--- runSql f conn = void do
---   q <- strConv Strict <$> readFile f
---   PG.execute_ conn q
+newtype ProjectId = ProjectId UUID
+  deriving (Show)
+
+--------------------------------------------------------------------------------
+-- the monad we run benchmarks in
 
 newtype BenchEnv = BenchEnv {benchConn :: Pool PG.Connection}
 
 newtype BenchM a = BenchM {unBenchM :: ReaderT BenchEnv IO a}
   deriving
-    (Functor, Applicative, Monad, MonadIO, MonadBase IO, MonadBaseControl IO, MonadReader BenchEnv)
+    ( Functor,
+      Applicative,
+      Monad,
+      MonadIO,
+      MonadBase IO,
+      MonadBaseControl IO,
+      MonadReader BenchEnv
+    )
     via (ReaderT BenchEnv IO)
+
+runBenchM :: BenchEnv -> BenchM a -> IO a
+runBenchM env k = runReaderT (unBenchM k) env
+
+--------------------------------------------------------------------------------
+-- database connections and connection pools
 
 withConn :: (PG.Connection -> BenchM a) -> BenchM a
 withConn k = do
   pool <- asks benchConn
   Pool.withResource pool k
 
-readQuery :: MonadIO m => FilePath -> m PG.Query
-readQuery f = Data.String.fromString . T.unpack <$> liftIO (readFile f)
-
-schemaSetup :: BenchM ()
-schemaSetup = withConn \conn -> do
-  putText "setting up schema"
-  setup <- readQuery "sql/setup.sql"
-  print =<< liftIO (PG.execute_ conn setup)
-
-createProjects :: Int -> Int -> BenchM [ProjectId]
-createProjects numProjects numEventsPerProject = withConn \conn -> do
-  putText "creating projects"
-
-  insertProjectIds <- readQuery "sql/insert_ids.sql"
-  uuid <- replicateM numProjects (ProjectId <$> liftIO UUID.nextRandom)
-  print =<< liftIO (PG.executeMany conn insertProjectIds (coerce uuid :: [PG.Only UUID]))
-
-  createEvents <- readQuery "sql/populate.sql"
-  print =<< liftIO (PG.execute conn createEvents (PG.Only numEventsPerProject))
-
-  pure uuid
-
-fetchEventsFor :: ProjectId -> BenchM ()
-fetchEventsFor (ProjectId proj) = withConn \conn -> do
-  putText ("fetching events for " <> show proj)
-  q <- readQuery "sql/fetch.sql"
-  print =<< liftIO (PG.execute conn q (proj, proj))
+initPool :: ConnString -> IO (Pool PG.Connection)
+initPool s = Pool.createPool (PG.connectPostgreSQL s) PG.close 4 60 10
 
 type ConnString = ByteString
 
 connStrLocalPG :: ConnString
 connStrLocalPG = "postgresql://postgres:password@localhost:5432/test"
 
-newtype ProjectId = ProjectId UUID
-  deriving (Show)
+readQuery :: MonadIO m => FilePath -> m PG.Query
+readQuery f = Data.String.fromString . T.unpack <$> liftIO (readFile f)
 
-runBenchM :: BenchEnv -> BenchM a -> IO a
-runBenchM env k = runReaderT (unBenchM k) env
+--------------------------------------------------------------------------------
+-- timing
 
-initPool :: ConnString -> IO (Pool PG.Connection)
-initPool s = Pool.createPool (PG.connectPostgreSQL s) PG.close 4 60 100
+-- | an interval in seconds with two digits of precision
+type Interval = Fixed.Fixed Fixed.E2
+
+newtype ElapsedTime = ElapsedTime Interval deriving (Show)
+
+measureElapsed :: MonadIO m => m a -> m (ElapsedTime, a)
+measureElapsed k = do
+  let getTime = liftIO (Clock.getTime Clock.Monotonic)
+  start <- getTime
+  ret <- k
+  end <- getTime
+  let d = fromInteger @Interval (Clock.toNanoSecs (Clock.diffTimeSpec end start))
+  pure (ElapsedTime (d / 1_000_000_000), ret)
+
+--------------------------------------------------------------------------------
+-- database operations
+
+schemaSetup :: BenchM ()
+schemaSetup = withConn \conn -> void do
+  putText "setting up schema"
+  setup <- readQuery "sql/setup.sql"
+  liftIO (PG.execute_ conn setup)
+
+createEventsFor :: ProjectId -> Int -> BenchM ()
+createEventsFor (ProjectId projectId) numEventsPerProject = withConn \conn -> do
+  q <- readQuery "sql/create_events.sql"
+  r <- liftIO (PG.execute conn q (projectId, numEventsPerProject))
+  putText ("created " <> show r <> " events")
+
+fetchEventsFor :: ProjectId -> Int -> BenchM ()
+fetchEventsFor (ProjectId proj) numEventsPerFetch = withConn \conn -> do
+  -- putText ("fetching events for " <> show proj)
+  q <- readQuery "sql/fetch.sql"
+  r <- liftIO (PG.execute conn q (proj, numEventsPerFetch, proj))
+  putText ("fetched " <> show r <> " events")
+
+projectWorker :: ProjectId -> Int -> BenchM ()
+projectWorker projId numEventsPerFetch = do
+  fetchEventsFor projId numEventsPerFetch
+  liftIO (threadDelay (1 * 1_000_000))
+
+--------------------------------------------------------------------------------
+-- toplevel
 
 main :: IO ()
 main = void do
   putText "starting benchmark"
   env <- BenchEnv <$> initPool connStrLocalPG
+  let numProjects = 100
+      numFetches = 10
+      numEventsPerFetch = 100
+      numEventsPerProject = numEventsPerFetch * numFetches
 
-  projIds <- runBenchM env do
-    schemaSetup
-    createProjects 400 400
+  projIds <- replicateM numProjects (ProjectId <$> liftIO UUID.nextRandom)
 
-  forConcurrently_ projIds \projId -> do
-    runBenchM env do
-      fetchEventsFor projId
+  runBenchM env do schemaSetup
+
+  (t, _) <- measureElapsed do
+    forConcurrently_ projIds \projId -> do
+      runBenchM env $
+        createEventsFor projId numEventsPerProject
+  print t
+
+  (t, _) <- measureElapsed do
+    forConcurrently_ projIds \projId -> do
+      runBenchM env $
+        replicateM_ numFetches $
+          projectWorker projId numEventsPerFetch
+  print t
