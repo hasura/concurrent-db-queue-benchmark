@@ -5,9 +5,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE NoImplicitPrelude #-}
 {-# OPTIONS_GHC -Wno-unused-imports #-}
+{-# LANGUAGE UndecidableInstances #-}
 
 module Main where
 
+import Control.Concurrent.Async (forConcurrently_)
+import Control.Monad.Trans.Control
+import Control.Monad.Base
 import Data.Coerce (coerce)
 import Data.Pool (Pool)
 import qualified Data.Pool as Pool
@@ -28,27 +32,30 @@ data Bench = BenchInsert | BenchFetch | BenchDelete
 --   q <- strConv Strict <$> readFile f
 --   PG.execute_ conn q
 
-newtype BenchEnv = BenchEnv {benchConn :: PG.Connection}
+newtype BenchEnv = BenchEnv {benchConn :: Pool PG.Connection}
 
 newtype BenchM a = BenchM {unBenchM :: ReaderT BenchEnv IO a}
   deriving
-    (Functor, Applicative, Monad, MonadIO, MonadReader BenchEnv)
+    (Functor, Applicative, Monad, MonadIO, MonadBase IO, MonadBaseControl IO, MonadReader BenchEnv)
     via (ReaderT BenchEnv IO)
+
+withConn :: (PG.Connection -> BenchM a) -> BenchM a
+withConn k = do
+  pool <- asks benchConn
+  Pool.withResource pool k
 
 readQuery :: MonadIO m => FilePath -> m PG.Query
 readQuery f = Data.String.fromString . T.unpack <$> liftIO (readFile f)
 
 schemaSetup :: BenchM ()
-schemaSetup = do
+schemaSetup = withConn \conn -> do
   putText "setting up schema"
-  conn <- asks benchConn
   setup <- readQuery "sql/setup.sql"
   print =<< liftIO (PG.execute_ conn setup)
 
 createProjects :: Int -> Int -> BenchM [ProjectId]
-createProjects numProjects numEventsPerProject = do
+createProjects numProjects numEventsPerProject = withConn \conn -> do
   putText "creating projects"
-  conn <- asks benchConn
 
   insertProjectIds <- readQuery "sql/insert_ids.sql"
   uuid <- replicateM numProjects (ProjectId <$> liftIO UUID.nextRandom)
@@ -59,14 +66,15 @@ createProjects numProjects numEventsPerProject = do
 
   pure uuid
 
-fetchEvents :: ProjectId -> BenchM ()
-fetchEvents (ProjectId proj) = do
+fetchEventsFor :: ProjectId -> BenchM ()
+fetchEventsFor (ProjectId proj) = withConn \conn -> do
   putText ("fetching events for " <> show proj)
   q <- readQuery "sql/fetch.sql"
-  conn <- asks benchConn
   print =<< liftIO (PG.execute conn q (proj, proj))
 
-connStrLocalPG :: ByteString
+type ConnString = ByteString
+
+connStrLocalPG :: ConnString
 connStrLocalPG = "postgresql://postgres:password@localhost:5432/test"
 
 newtype ProjectId = ProjectId UUID
@@ -75,13 +83,18 @@ newtype ProjectId = ProjectId UUID
 runBenchM :: BenchEnv -> BenchM a -> IO a
 runBenchM env k = runReaderT (unBenchM k) env
 
+initPool :: ConnString -> IO (Pool PG.Connection)
+initPool s = Pool.createPool (PG.connectPostgreSQL s) PG.close 4 60 100
+
 main :: IO ()
 main = void do
   putText "starting benchmark"
-  conn <- PG.connectPostgreSQL connStrLocalPG
-  let env = BenchEnv conn
-  runBenchM env do
+  env <- BenchEnv <$> initPool connStrLocalPG
+
+  projIds <- runBenchM env do
     schemaSetup
-    projIds <- createProjects 100 100
-    for_ projIds \projId -> do
-      fetchEvents projId
+    createProjects 400 400
+
+  forConcurrently_ projIds \projId -> do
+    runBenchM env do
+      fetchEventsFor projId
