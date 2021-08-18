@@ -1,175 +1,87 @@
 {-# LANGUAGE BlockArguments #-}
-{-# LANGUAGE ImportQualifiedPost #-}
+{-# LANGUAGE DerivingStrategies #-}
+{-# LANGUAGE DerivingVia #-}
 {-# LANGUAGE LambdaCase #-}
-{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE NoImplicitPrelude #-}
+{-# OPTIONS_GHC -Wno-unused-imports #-}
 
-import Control.Concurrent
-import Control.Concurrent.Async
-import Control.Concurrent.STM
-import Control.Concurrent.STM.TMVar
-import Control.Concurrent.STM.TVar
-import Control.Monad
-import Data.ByteString (ByteString)
-import Data.ByteString qualified as BS
-import Data.Foldable
-import Data.IORef
-import Data.String (IsString (..))
-import Data.Traversable
+module Main where
+
+import Data.Coerce (coerce)
+import Data.Pool (Pool)
+import qualified Data.Pool as Pool
+import qualified Data.String
+import qualified Data.Text as T
 import Data.UUID (UUID)
-import Database.PostgreSQL.Simple
-import Formatting
-import Formatting.Clock
-import System.Clock
-import System.Environment (getArgs)
-import System.IO.Unsafe
+import qualified Data.UUID.V4 as UUID
+import Data.Vector (Vector)
+import qualified Data.Vector as V
+import qualified Database.PostgreSQL.Simple as PG
+import Protolude
+import Protolude.Conv
 
-yb :: ByteString
-yb = "postgresql://yugabyte:yugabyte@localhost:5433/db"
-
-pg :: ByteString
-pg = "postgresql://postgres:password@localhost:8000/postgres"
-
-citus1 :: ByteString
-citus1 = "postgresql://postgres:password@localhost:5434/postgres"
-
-citus :: ByteString
-citus = "postgresql://postgres:password@localhost:5440/postgres"
-
--- | 2 KB of garbage
-stuff :: ByteString
-stuff = fromString $ replicate 2048 'a'
-
-runSql f conn = void do
-  q <- fromString <$> readFile f
-  execute_ conn q
-
-fetch1 :: Connection -> IO ()
-fetch1 = runSql "fetch1.sql"
-
-fetch2 :: Connection -> IO ()
-fetch2 = runSql "fetch2.sql"
-
-micro :: Int
-micro = 1000000
-
-data LockState = YourMove
-  deriving (Show)
-data Client = Alicia | Bobert
+data Bench = BenchInsert | BenchFetch | BenchDelete
   deriving (Show)
 
-processEvents :: Client -> Connection -> TVar Int -> Maybe (TMVar LockState, TMVar LockState) -> String -> IO ()
-processEvents ident conn counter Nothing q = go
-  where
-    go = forever do
-      -- putStrLn $ show ident <> " start"
-      runSql q conn
-      -- putStrLn $ show ident <> " done"
-      atomically do
-        modifyTVar' counter (+ 1)
-processEvents ident conn counter (Just (ownLock, rivalLock)) q = go
-  where
-    go = forever do
-      n <- readTVarIO counter 
-      -- putStrLn $ show ident <> " #" <> show n <> "   pre: start, waiting to take rival"
-      states <- atomically do
-        YourMove <- takeTMVar rivalLock
-        (,) <$> isEmptyTMVar ownLock <*> isEmptyTMVar rivalLock
-      -- putStrLn $ show ident <> " #" <> show n <> "   pre: took from rival lock"
-      runSql q conn
-      -- putStrLn $ show ident <> " #" <> show n <> "  post: waiting to write own"
-      states <- atomically do
-        modifyTVar' counter (+ 1)
-        putTMVar ownLock YourMove
-        (,) <$> isEmptyTMVar ownLock <*> isEmptyTMVar rivalLock
-      pure ()
-      -- putStrLn $ show ident <> " #" <> show n <> "  post: wrote to own lock, done"
+-- runSql f conn = void do
+--   q <- strConv Strict <$> readFile f
+--   PG.execute_ conn q
 
--- putStrLn $ "grab event id " <> show e
--- threadDelay processingDelay
--- putStrLn $ "done event id " <> show e
+newtype BenchEnv = BenchEnv {benchConn :: PG.Connection}
 
-data Locking = UseLock | NoLock
+newtype BenchM a = BenchM {unBenchM :: ReaderT BenchEnv IO a}
+  deriving
+    (Functor, Applicative, Monad, MonadIO, MonadReader BenchEnv)
+    via (ReaderT BenchEnv IO)
 
-data Filter = Conflict | Independent
+readQuery :: MonadIO m => FilePath -> m PG.Query
+readQuery f = Data.String.fromString . T.unpack <$> liftIO (readFile f)
 
-client :: ByteString -> Locking -> IO ()
-client connString _ = void do
-  putStrLn $ "using conn string: " <> show connString
-  runTest UseLock Conflict
-  runTest NoLock Conflict
-  where
-    runTest l filt = do
-      putStrLn "initialising db... "
-      conn1 <- connectPostgreSQL connString
-      conn2 <- connectPostgreSQL connString
-      start <- getTime Monotonic
-      initDb conn1
-      end <- getTime Monotonic
-      putStrLn $
-        "init took "
-          <> show (toNanoSecs (diffTimeSpec end start) `div` 1_000_000_000)
-          <> " seconds"
+schemaSetup :: BenchM ()
+schemaSetup = do
+  putText "setting up schema"
+  conn <- asks benchConn
+  setup <- readQuery "sql/setup.sql"
+  print =<< liftIO (PG.execute_ conn setup)
 
-      counter1 <- newTVarIO 0
-      counter2 <- newTVarIO 0
+createProjects :: Int -> Int -> BenchM [ProjectId]
+createProjects numProjects numEventsPerProject = do
+  putText "creating projects"
+  conn <- asks benchConn
 
-      (locks1, locks2) <- case l of
-        UseLock -> atomically do
-          lock <- newEmptyTMVar
-          lock' <- newTMVar YourMove -- CRITICAL that only one tmvar is filled
-          pure (Just (lock, lock'), Just (lock', lock)) -- TODO this looks sketchy lol
-        NoLock -> pure (Nothing, Nothing)
-      handle1 <- async do processEvents Alicia conn1 counter1 locks1 "fetch1.sql"
-      handle2 <- async do
-        processEvents
-          Bobert
-          conn2
-          counter2
-          locks2
-          ( case filt of
-              Conflict -> "fetch1.sql"
-              Independent -> "fetch2.sql"
-          )
-      start <- getTime Monotonic
-      threadDelay (120 * micro)
-      cancel handle1
-      cancel handle2
-      end <- getTime Monotonic
-      n1 <- readTVarIO counter1
-      n2 <- readTVarIO counter2
-      putStrLn $
-        (case filt of 
-           Conflict -> "same"
-           Independent -> "different") <> " project ids: "
-          <> "processed "
-          <> show n1
-          <> " + "
-          <> show n2
-          <> " = "
-          <> show (n1 + n2)
-          <> " fetches in "
-          <> show (toNanoSecs (diffTimeSpec end start) `div` 1_000_000)
-          <> " ms"
+  insertProjectIds <- readQuery "sql/insert_ids.sql"
+  uuid <- replicateM numProjects (ProjectId <$> liftIO UUID.nextRandom)
+  print =<< liftIO (PG.executeMany conn insertProjectIds (coerce uuid :: [PG.Only UUID]))
+
+  createEvents <- readQuery "sql/populate.sql"
+  print =<< liftIO (PG.execute conn createEvents (PG.Only numEventsPerProject))
+
+  pure uuid
+
+fetchEvents :: ProjectId -> BenchM ()
+fetchEvents (ProjectId proj) = do
+  putText ("fetching events for " <> show proj)
+  q <- readQuery "sql/fetch.sql"
+  conn <- asks benchConn
+  print =<< liftIO (PG.execute conn q (proj, proj))
+
+connStrLocalPG :: ByteString
+connStrLocalPG = "postgresql://postgres:password@localhost:5432/test"
+
+newtype ProjectId = ProjectId UUID
+  deriving (Show)
+
+runBenchM :: BenchEnv -> BenchM a -> IO a
+runBenchM env k = runReaderT (unBenchM k) env
 
 main :: IO ()
-main = do
-  args <- getArgs
-  case args of
-    [db, locking] -> do
-      let connString = case db of
-            "pg" -> pg
-            "yb" -> yb
-            "citus" -> citus
-            "citus1" -> citus1
-      let useLocks = case locking of
-            "enable-locking" -> UseLock
-            "disable-locking" -> NoLock
-      client connString useLocks
-    _ -> putStrLn "error: bad args"
-
-initDb :: Connection -> IO ()
-initDb conn = do
-  q <- fromString <$> readFile "project_id_setup.sql"
-  execute_ conn q
-  pure ()
+main = void do
+  putText "starting benchmark"
+  conn <- PG.connectPostgreSQL connStrLocalPG
+  let env = BenchEnv conn
+  runBenchM env do
+    schemaSetup
+    projIds <- createProjects 100 100
+    for_ projIds \projId -> do
+      fetchEvents projId

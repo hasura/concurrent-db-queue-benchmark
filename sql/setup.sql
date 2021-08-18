@@ -20,11 +20,3 @@ CREATE INDEX hdb_cron_events_project_id_status ON hdb_cron_events (project_id, s
 CREATE UNIQUE INDEX hdb_cron_events_unique_scheduled
 ON hdb_cron_events (project_id, trigger_name, scheduled_time)
 WHERE status = 'scheduled';
-
--- for project1
-insert into hdb_cron_events (trigger_name, project_id, scheduled_time)
-select 'test_cron_trigger', 'project1', generate_series('2008-01-01 00:00'::timestamp, '2009-01-01 00:00', '1 minute') as scheduled_time;
-
--- for project2
-insert into hdb_cron_events (trigger_name, project_id, scheduled_time)
-select 'test_cron_trigger', 'project2', generate_series('2008-01-01 00:00'::timestamp, '2009-01-01 00:00', '1 minute') as scheduled_time;

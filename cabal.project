@@ -1,0 +1,16 @@
+packages: .
+
+package *
+  optimization: 2
+  ghc-options: -Wall
+
+source-repository-package
+  type: git
+  location: https://github.com/hasura/pg-client-hs.git
+  tag: 92975d0f8f933c8d06913dc97af259253bf7fb5f
+
+source-repository-package
+  type: git
+  location: https://github.com/hasura/pool.git
+  tag: bc4c3f739a8fb8ec4444336a34662895831c9acf
+
