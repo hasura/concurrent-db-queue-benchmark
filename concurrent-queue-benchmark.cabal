@@ -11,6 +11,7 @@ executable concurrent-queue-benchmark
   build-depends:
     , async
     , base               ^>=4.14.1.0
+    , statistics
     , bytestring
     , clock
     , formatting

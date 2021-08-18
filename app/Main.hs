@@ -4,6 +4,7 @@
 {-# LANGUAGE LambdaCase #-}
 {-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# LANGUAGE NoImplicitPrelude #-}
@@ -11,7 +12,7 @@
 
 module Main where
 
-import Control.Concurrent.Async (forConcurrently_)
+import Control.Concurrent.Async
 import Control.Monad.Base
 import Control.Monad.Trans.Control
 import Data.Coerce (coerce)
@@ -23,17 +24,22 @@ import qualified Data.Text as T
 import Data.UUID (UUID)
 import qualified Data.UUID.V4 as UUID
 import Data.Vector (Vector)
-import qualified Data.Vector as V
+import qualified Data.Vector as Vector
 import qualified Database.PostgreSQL.Simple as PG
 import Protolude
 import Protolude.Conv
+import qualified Statistics.Sample as Statistics
 import qualified System.Clock as Clock
+import Text.Printf
 
 data Bench = BenchInsert | BenchFetch | BenchDelete
   deriving (Show)
 
 newtype ProjectId = ProjectId UUID
   deriving (Show)
+
+mkProjectId :: MonadIO m => m ProjectId
+mkProjectId = ProjectId <$> liftIO UUID.nextRandom
 
 --------------------------------------------------------------------------------
 -- the monad we run benchmarks in
@@ -72,12 +78,12 @@ connStrLocalPG :: ConnString
 connStrLocalPG = "postgresql://postgres:password@localhost:5432/test"
 
 readQuery :: MonadIO m => FilePath -> m PG.Query
-readQuery f = Data.String.fromString . T.unpack <$> liftIO (readFile f)
+readQuery f = Data.String.fromString @PG.Query . T.unpack <$> liftIO (readFile f)
 
 --------------------------------------------------------------------------------
 -- timing
 
--- | an interval in seconds with two digits of precision
+-- | an interval in milliseconds with two digits of precision
 type Interval = Fixed.Fixed Fixed.E2
 
 newtype ElapsedTime = ElapsedTime Interval deriving (Show)
@@ -89,34 +95,56 @@ measureElapsed k = do
   ret <- k
   end <- getTime
   let d = fromInteger @Interval (Clock.toNanoSecs (Clock.diffTimeSpec end start))
-  pure (ElapsedTime (d / 1_000_000_000), ret)
+  pure (ElapsedTime (d / 1_000_000), ret)
+
+elapsedTime :: MonadIO m => m a -> m ElapsedTime
+elapsedTime k = fst <$> measureElapsed k
 
 --------------------------------------------------------------------------------
--- database operations
+-- statistics
 
-schemaSetup :: BenchM ()
-schemaSetup = withConn \conn -> void do
-  putText "setting up schema"
-  setup <- readQuery "sql/setup.sql"
-  liftIO (PG.execute_ conn setup)
+data Stats a = Stats
+  { statsCount :: Int,
+    statsMean :: a,
+    statsStdDev :: a,
+    statsSkewness :: a
+  } deriving (Show)
 
-createEventsFor :: ProjectId -> Int -> BenchM ()
-createEventsFor (ProjectId projectId) numEventsPerProject = withConn \conn -> do
-  q <- readQuery "sql/create_events.sql"
-  r <- liftIO (PG.execute conn q (projectId, numEventsPerProject))
-  putText ("created " <> show r <> " events")
+toElapsedTime :: Double -> ElapsedTime
+toElapsedTime = ElapsedTime . realToFrac
 
-fetchEventsFor :: ProjectId -> Int -> BenchM ()
-fetchEventsFor (ProjectId proj) numEventsPerFetch = withConn \conn -> do
-  -- putText ("fetching events for " <> show proj)
-  q <- readQuery "sql/fetch.sql"
-  r <- liftIO (PG.execute conn q (proj, numEventsPerFetch, proj))
-  putText ("fetched " <> show r <> " events")
+fromElapsedTime :: ElapsedTime -> Double
+fromElapsedTime (ElapsedTime e) = realToFrac e
 
-projectWorker :: ProjectId -> Int -> BenchM ()
-projectWorker projId numEventsPerFetch = do
-  fetchEventsFor projId numEventsPerFetch
-  liftIO (threadDelay (1 * 1_000_000))
+instance PrintfArg ElapsedTime where
+  formatArg = formatArg . fromElapsedTime
+
+computeStats :: Vector ElapsedTime -> Stats ElapsedTime
+computeStats xs = Stats count mean std skew
+  where
+    count = Vector.length xs
+    [mean, std, skew] =
+      map
+        (\f -> toElapsedTime $ f $ Vector.map fromElapsedTime xs)
+        [ Statistics.mean,
+          Statistics.stdDev,
+          Statistics.skewness
+        ]
+
+ppStats :: MonadIO m => Vector ElapsedTime -> m ()
+ppStats xs =
+  let Stats {..} = computeStats xs
+   in liftIO $
+        printf
+          "n = %3d, mean %8.1f ms, stddev %8.1f ms"
+          statsCount
+          statsMean
+          statsStdDev
+
+timedReplicate :: MonadIO m => Int -> m a -> m (Vector ElapsedTime)
+timedReplicate n k =
+    Vector.forM (Vector.fromList [1 .. n]) \_i ->
+      elapsedTime k
 
 --------------------------------------------------------------------------------
 -- toplevel
@@ -125,24 +153,52 @@ main :: IO ()
 main = void do
   putText "starting benchmark"
   env <- BenchEnv <$> initPool connStrLocalPG
-  let numProjects = 100
+  let numProjects = 10000
       numFetches = 10
       numEventsPerFetch = 100
       numEventsPerProject = numEventsPerFetch * numFetches
 
-  projIds <- replicateM numProjects (ProjectId <$> liftIO UUID.nextRandom)
+  projIds <- replicateM numProjects mkProjectId
 
+  putText "setting up schema"
   runBenchM env do schemaSetup
 
-  (t, _) <- measureElapsed do
-    forConcurrently_ projIds \projId -> do
-      runBenchM env $
+  putText "creating events"
+  forConcurrently_ projIds \projId -> do
+    runBenchM env $ do
+      elapsedTime do
         createEventsFor projId numEventsPerProject
-  print t
 
-  (t, _) <- measureElapsed do
-    forConcurrently_ projIds \projId -> do
-      runBenchM env $
-        replicateM_ numFetches $
-          projectWorker projId numEventsPerFetch
-  print t
+  putText "fetching events"
+  batchFetchTimes <- Vector.concat <$> forConcurrently projIds \projId -> do
+    runBenchM env do
+      timedReplicate numFetches (projectWorker projId numEventsPerFetch)
+  ppStats batchFetchTimes
+
+--------------------------------------------------------------------------------
+-- database operations
+
+schemaSetup :: BenchM ()
+schemaSetup = withConn \conn -> void do
+  setup <- readQuery "sql/setup.sql"
+  liftIO (PG.execute_ conn setup)
+  -- putText ("created schema: " <> show r)
+
+createEventsFor :: ProjectId -> Int -> BenchM ()
+createEventsFor (ProjectId projectId) numEventsPerProject = withConn \conn -> void do
+  q <- readQuery "sql/create_events.sql"
+  liftIO (PG.execute conn q (projectId, numEventsPerProject))
+  -- putText ("created " <> show r <> " events")
+
+fetchEventsFor :: ProjectId -> Int -> BenchM ()
+fetchEventsFor (ProjectId proj) numEventsPerFetch = withConn \conn -> void do
+  -- putText ("fetching events for " <> show proj)
+  q <- readQuery "sql/fetch.sql"
+  liftIO (PG.execute conn q (proj, numEventsPerFetch, proj))
+  -- putText ("fetched " <> show r <> " events")
+
+projectWorker :: ProjectId -> Int -> BenchM ()
+projectWorker projId numEventsPerFetch = do
+  fetchEventsFor projId numEventsPerFetch
+  liftIO (threadDelay (1 * 1_000_000))
+
